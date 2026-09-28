@@ -5,18 +5,18 @@
   "description": "Off-chain event indexer for VestFlow Soroban contract events",
   "main": "dist/poller.js",
   "scripts": {
-    "dev": "ts-node src/poller.ts",
-    "dev:server": "ts-node src/server.ts",
-    "dev:all": "concurrently \"npm run dev\" \"npm run dev:server\"",
+    "dev": "node init && ts-node src/poller.ts",
+    "dev:server": "node init && ts-node src/server.ts",
+    "dev:all": "node init && concurrently \"npm run dev\" \"npm run dev:server\"",
     "test:pagination": "ts-node test/pagination_test.ts",
     "test:drips-api": "ts-node test/drips-api.test.ts",
     "test:drips-events": "ts-node test/drips-events-projection.test.ts",
     "test:webhook-load": "ts-node test/webhook_load_test.ts",
     "test:streams-load": "ts-node --files scripts/load-test-streams.ts",
     "benchmark:analytics": "ts-node --files scripts/benchmark-analytics.ts",
-    "build": "tsc",
-    "start": "node dist/poller.js",
-    "start:server": "node dist/server.js"
+    "build": "node init && tsc",
+    "start": "node init && node dist/poller.js",
+    "start:server": "node init && node dist/server.js"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^15.1.0",
