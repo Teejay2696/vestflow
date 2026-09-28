@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "node init && next dev",
+    "build": "node init && next build",
+    "start": "node init && next start",
     "contracts:metrics": "bash scripts/contract-metrics.sh",
     "bindings:generate": "bash scripts/generate-bindings.sh",
     "bindings:build": "npm --prefix lib/bindings/vestflow install && npm --prefix lib/bindings/vestflow run build",
@@ -13,7 +13,7 @@
     "worker:build": "tsup --config workers/tsup.config.ts",
     "prebuild": "npm run worker:build",
     "predev": "npm run worker:build",
-    "dev:reset": "bash scripts/dev-reset.sh",
+    "dev:reset": "node init && bash scripts/dev-reset.sh",
     "lint": "eslint .",
     "doctor": "node scripts/doctor.js"
   },
