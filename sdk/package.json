@@ -34,8 +34,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsup --config tsup.esm.config.ts && tsup --config tsup.cjs.config.ts && node scripts/finalize-dist.mjs",
-    "dev": "tsup --config tsup.esm.config.ts --watch",
+    "build": "node init && tsup --config tsup.esm.config.ts && tsup --config tsup.cjs.config.ts && node scripts/finalize-dist.mjs",
+    "dev": "node init && tsup --config tsup.esm.config.ts --watch",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
