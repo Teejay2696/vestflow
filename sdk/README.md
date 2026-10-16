@@ -276,6 +276,8 @@ try {
 | `getRemainingUnvested(id, publicKey?)` | `Promise<bigint>` | Unvested remainder (what a revoke would recover) |
 | `getAllSchedules(publicKey?)` | `Promise<ScheduleData[]>` | All schedules |
 | `getStreams(account, indexerUrl?)` | `Promise<Stream[]>` | Active outgoing streams for an account |
+| `getDripsListMembers(listId, options?)` | `Promise<{ items, nextCursor? }>` | Paginated Drips list members from the indexer |
+| `getTokenList()` | `Promise<SupportedToken[]>` | Supported tokens from the indexer |
 | `getBalance(account, token, publicKey?)` | `Promise<BalanceResult>` | Live streaming balance and collectable amount, via simulation |
 | `getSplits(account)` | `Promise<SplitsConfig>` | Current splits configuration for an account, from the indexer |
 | `getProfile(address)` | `Promise<ProfileSummary>` | Aggregated streams/splits/gives/Drips lists profile for an address |
@@ -315,6 +317,8 @@ try {
 | `formatDate(timestamp)` | Format Unix timestamp as date string |
 | `parseContractError(error)` | Map contract error to user-friendly message |
 | `formatRate(amtPerSec, token, decimals)` | Format a per-second flow rate, e.g. "0.008640 XLM / day" |
+| `formatXlm(stroops)` | Format stroops as human-readable XLM |
+| `DripsErrorCode` | Numeric contract error-code enum |
 
 ### Errors
 

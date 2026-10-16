@@ -338,6 +338,24 @@ export interface DripsListSummary {
   memberCount: number;
 }
 
+/** A member of a Drips list as returned by the indexer. */
+export interface DripsListMember {
+  address: string;
+  joinedAt: number;
+}
+
+/** Pagination options shared by indexer list queries. */
+export interface PaginationOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+/** A token supported by the VestFlow indexer. */
+export interface SupportedToken {
+  address: string;
+  displayName: string;
+}
+
 /**
  * Aggregated activity for a single address, returned by
  * `VestflowClient.getProfile`.

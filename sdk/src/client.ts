@@ -44,6 +44,9 @@ import type {
   GiveHistoryOptions,
   DripsListSummary,
   SplitsReceiver,
+  DripsListMember,
+  PaginationOptions,
+  SupportedToken,
 } from "./types";
 import { ProfileError } from "./types";
 import { xlmToStroops } from "./utils";
@@ -177,6 +180,52 @@ export class VestflowClient {
     return (result as any).result!.retval;
   }
 
+  // ── Fee estimation ─────────────────────────────────────────────────────
+
+  /**
+   * Estimates the network fee for a contract call without building or
+   * submitting a transaction (#1096).
+   *
+   * Simulates the call the same way {@link simulate} and the write methods
+   * do, then reads the resource fee Soroban RPC computed off the
+   * simulation's resource usage.
+   *
+   * @param contractCall - The method name and arguments to estimate
+   * @param contractCall.method - Contract method name, e.g. "createSchedule"
+   * @param contractCall.args - ScVal arguments for the call
+   * @param contractCall.publicKey - Optional source account; falls back to
+   *   a well-known placeholder account when omitted (mirrors {@link simulate})
+   * @returns `resourceFee` (the simulated resource fee alone) and
+   *   `totalFee` (`resourceFee` plus the inclusion fee a built transaction
+   *   would pay), both in stroops
+   */
+  async estimateFee(contractCall: {
+    method: string;
+    args: xdr.ScVal[];
+    publicKey?: string;
+  }): Promise<{ resourceFee: bigint; totalFee: bigint }> {
+    const { method, args, publicKey } = contractCall;
+    const contract = new Contract(this.contractId);
+    const source = publicKey ?? FALLBACK_ACCOUNT;
+    const account = await this.server.getAccount(source);
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    const result = await this.server.simulateTransaction(tx);
+    if (StellarRpc.Api.isSimulationError(result)) {
+      throw new Error((result as any).error);
+    }
+
+    const resourceFee = BigInt((result as any).minResourceFee ?? "0");
+    const totalFee = BigInt(BASE_FEE) + resourceFee;
+    return { resourceFee, totalFee };
+  }
+
   // ── Internal: build, send, and wait for settlement ────────────────────────
 
   private async submitAndSettle(
@@ -229,6 +278,52 @@ export class VestflowClient {
     return hash;
   }
 
+  // ── Internal: build, send, and wait for settlement (multi-operation) ──────
+
+  /**
+   * Like {@link submitAndSettle}, but builds a transaction with one
+   * operation per `calls` entry instead of a single contract call. Used for
+   * batch membership changes that have no bulk contract entry point (#1092,
+   * #1093), so the whole batch still settles as a single transaction.
+   */
+  private async submitAndSettleMulti(
+    publicKey: string,
+    calls: { method: string; args: xdr.ScVal[] }[],
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<TransactionResult> {
+    const contract = new Contract(this.contractId);
+    const account = await this.server.getAccount(publicKey);
+    let tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    });
+    for (const call of calls) {
+      tx = tx.addOperation(contract.call(call.method, ...call.args));
+    }
+    let built = tx.setTimeout(30).build();
+
+    const simResult = await this.server.simulateTransaction(built);
+    if (StellarRpc.Api.isSimulationError(simResult)) {
+      throw new Error((simResult as any).error);
+    }
+    built = StellarRpc.assembleTransaction(built, simResult as any).build();
+
+    const signed = await signer(built.toXDR(), {
+      networkPassphrase: this.networkPassphrase,
+    });
+    const xdrStr = typeof signed === "string" ? signed : (signed as any).signedTxXdr;
+    const submitted = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(xdrStr, this.networkPassphrase)
+    );
+    if (submitted.status === "ERROR") throw new Error("Transaction failed");
+
+    const settled = await this.waitForTransaction(submitted.hash);
+    return {
+      hash: submitted.hash,
+      status: settled.status === "SUCCESS" ? "SUCCESS" : "FAILED",
+    };
+  }
+
   // ── Poll ──────────────────────────────────────────────────────────────────
 
   /**
@@ -257,6 +352,21 @@ export class VestflowClient {
       maxDelayMs: options.maxDelayMs,
       getTransaction: (h) => this.server.getTransaction(h),
     });
+  }
+
+  // ── Contract metadata ──────────────────────────────────────────────────────
+
+  /**
+   * Fetch the connected contract's version string via its `version` view.
+   *
+   * Useful for confirming the SDK is talking to the expected contract
+   * build before relying on method/entry-point compatibility (#1094).
+   *
+   * @returns The contract's version string.
+   */
+  async version(): Promise<string> {
+    const val = await this.simulate("version", []);
+    return String(scValToNative(val));
   }
 
   // ── Indexer ────────────────────────────────────────────────────────────────
@@ -295,6 +405,44 @@ export class VestflowClient {
       ratePerSec: BigInt(String(item.ratePerSec ?? item.rate_per_sec ?? 0)),
       maxEndTime: Number(item.maxEndTime ?? item.max_end_time ?? 0),
     }));
+  }
+
+  /** Fetch the current members of a Drips list from the indexer. */
+  async getDripsListMembers(
+    listId: string,
+    options: PaginationOptions = {},
+  ): Promise<{ items: DripsListMember[]; nextCursor?: string }> {
+    const params = new URLSearchParams({ network: this.network });
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const url = `${this.indexerUrl.replace(/\/$/, "")}/lists/${encodeURIComponent(listId)}/members?${params}`;
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!res.ok) throw new Error(`Indexer request failed: ${res.status} ${res.statusText}`);
+    const body = (await res.json()) as { members?: Record<string, unknown>[]; next_cursor?: string | null };
+    return {
+      items: (body.members ?? []).map((member) => ({
+        address: String(member.address ?? ""),
+        joinedAt: Number(member.joinedAt ?? member.joined_at ?? 0),
+      })),
+      nextCursor: body.next_cursor ?? undefined,
+    };
+  }
+
+  /** Fetch tokens supported by the configured indexer. */
+  async getTokenList(): Promise<SupportedToken[]> {
+    try {
+      const url = `${this.indexerUrl.replace(/\/$/, "")}/tokens/supported?network=${encodeURIComponent(this.network)}`;
+      const res = await fetch(url, { headers: { Accept: "application/json" } });
+      if (!res.ok) return [];
+      const body = (await res.json()) as { tokens?: Record<string, unknown>[] } | Record<string, unknown>[];
+      const tokens = Array.isArray(body) ? body : body.tokens ?? [];
+      return tokens.map((token) => ({
+        address: String(token.address ?? token.token ?? ""),
+        displayName: String(token.displayName ?? token.display_name ?? token.name ?? ""),
+      }));
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -1174,6 +1322,52 @@ export class VestflowClient {
     // Re-read collected amount from a fresh simulation if we used the sentinel.
     const collected = claimable === 1n ? 0n : claimable;
     return { collected, txHash };
+  }
+
+  /**
+   * Atomically sweep an account's collectable balance and distribute it to
+   * its current splits receivers in one transaction (#1095).
+   *
+   * Probes `collectable_amount` first; if nothing is collectable the
+   * transaction is **not** submitted and the method resolves with
+   * `{ collected: 0n, txHash: "" }`, mirroring {@link collect}.
+   *
+   * Fetches the account's current splits receivers via the contract's own
+   * `splits` view (not the indexer) and passes that raw value straight into
+   * `split_collect`, so the on-chain configuration used is exactly the one
+   * the contract itself reports, with no re-encoding.
+   *
+   * @param account - Stellar address whose collectable balance to sweep and split.
+   * @param token - Stellar Asset Contract address of the token.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns `{ collected, txHash }`. When nothing was collectable, `txHash`
+   *   is `""` and `collected` is `0n`.
+   */
+  async splitAndCollect(
+    account: string,
+    token: string,
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<CollectResult> {
+    const accountVal = nativeToScVal(account, { type: "address" });
+    const tokenVal = nativeToScVal(token, { type: "address" });
+
+    const collectableVal = await this.simulate("collectable_amount", [accountVal, tokenVal], account);
+    const collectable = BigInt(scValToNative(collectableVal) ?? 0);
+
+    if (collectable === 0n) {
+      return { collected: 0n, txHash: "" };
+    }
+
+    const receiversVal = await this.simulate("splits", [accountVal], account);
+
+    const txHash = await this.buildAndSend(
+      account,
+      "split_collect",
+      [accountVal, tokenVal, receiversVal],
+      signer
+    );
+
+    return { collected: collectable, txHash };
   }
 
   /**
@@ -2084,6 +2278,92 @@ export class VestflowClient {
     ];
 
     return this.submitAndSettle(account, "set_splits", args, signer);
+  }
+
+  /**
+   * Add one or more member addresses to a drips list (#1092).
+   *
+   * The contract only exposes a single-member `add_to_drips_list` entry
+   * point, so this submits one `add_to_drips_list` operation per address,
+   * all within a single transaction, rather than requiring a separate
+   * transaction per member. Only the list owner may call this; a non-owner
+   * `owner` is rejected by the contract itself when the transaction settles.
+   *
+   * @param owner - List owner's Stellar public key; also the transaction source.
+   * @param listId - Drips list ID.
+   * @param addresses - Member addresses to add.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns The settled {@link TransactionResult}.
+   */
+  async addDripsListMembers(
+    owner: string,
+    listId: number,
+    addresses: string[],
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<TransactionResult> {
+    if (!StrKey.isValidEd25519PublicKey(owner)) {
+      throw new Error("owner must be a valid Stellar public key");
+    }
+    if (addresses.length === 0) {
+      throw new Error("addresses must not be empty");
+    }
+    for (const [i, address] of addresses.entries()) {
+      if (!StrKey.isValidEd25519PublicKey(address) && !StrKey.isValidContract(address)) {
+        throw new Error(`addresses[${i}] must be a valid Stellar address`);
+      }
+    }
+
+    const ownerVal = nativeToScVal(owner, { type: "address" });
+    const listIdVal = nativeToScVal(listId, { type: "u64" });
+    const calls = addresses.map((address) => ({
+      method: "add_to_drips_list",
+      args: [ownerVal, listIdVal, nativeToScVal(address, { type: "address" })],
+    }));
+
+    return this.submitAndSettleMulti(owner, calls, signer);
+  }
+
+  /**
+   * Remove one or more member addresses from a drips list (#1093).
+   *
+   * The contract only exposes a single-member `remove_from_drips_list`
+   * entry point, so this submits one `remove_from_drips_list` operation per
+   * address, all within a single transaction. Only the list owner may call
+   * this; a non-owner `owner` is rejected by the contract itself when the
+   * transaction settles.
+   *
+   * @param owner - List owner's Stellar public key; also the transaction source.
+   * @param listId - Drips list ID.
+   * @param addresses - Member addresses to remove.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns The settled {@link TransactionResult}.
+   */
+  async removeDripsListMembers(
+    owner: string,
+    listId: number,
+    addresses: string[],
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<TransactionResult> {
+    if (!StrKey.isValidEd25519PublicKey(owner)) {
+      throw new Error("owner must be a valid Stellar public key");
+    }
+    if (addresses.length === 0) {
+      throw new Error("addresses must not be empty");
+    }
+    for (const [i, address] of addresses.entries()) {
+      if (!StrKey.isValidEd25519PublicKey(address) && !StrKey.isValidContract(address)) {
+        throw new Error(`addresses[${i}] must be a valid Stellar address`);
+      }
+    }
+
+    const ownerVal = nativeToScVal(owner, { type: "address" });
+    const listIdVal = nativeToScVal(listId, { type: "u64" });
+    const calls = addresses.map((address) => ({
+      method: "remove_from_drips_list",
+      args: [ownerVal, listIdVal, nativeToScVal(address, { type: "address" })],
+    }));
+
+    return this.submitAndSettleMulti(owner, calls, signer);
   }
 }
 

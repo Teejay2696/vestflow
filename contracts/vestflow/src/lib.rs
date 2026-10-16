@@ -68,6 +68,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Maximum split weight a single receiver can have (100% = 1_000_000 parts per million).
 pub const TOTAL_SPLITS_WEIGHT: u128 = 1_000_000;
 
+/// Maximum number of receivers allowed in a splits configuration.
+pub const MAX_SPLITS_RECEIVERS: u32 = 100;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -118,6 +121,10 @@ pub enum VestFlowError {
     WeightTooLarge = 35,
     /// A drips list view was called with an ID that was never created.
     ListNotFound = 36,
+    /// `validate_splits_receivers` found two receivers sharing the same address.
+    DuplicateReceiver = 37,
+    /// `validate_splits_receivers` was given more receivers than `MAX_SPLITS_RECEIVERS`.
+    TooManyReceivers = 38,
 }
 
 #[contracttype]
@@ -5755,6 +5762,84 @@ impl VestFlowContract {
             .unwrap_or_else(|| vec![&env])
     }
 
+    /// Validate a proposed splits receiver list without modifying any state.
+    ///
+    /// Returns a list of every error found.  An empty list means the receivers
+    /// are valid and would be accepted by `set_splits`.  Multiple errors can be
+    /// present at once — each rule is checked independently.
+    ///
+    /// Rules checked (in order):
+    /// 1. Empty list is always valid — returns an empty error list immediately.
+    /// 2. `TooManyReceivers` — more than `MAX_SPLITS_RECEIVERS` entries.
+    /// 3. `DuplicateReceiver` — the same address appears more than once.
+    /// 4. `WeightZero` — any receiver has a zero weight.
+    /// 5. `WeightTooLarge` — any single receiver's weight exceeds `TOTAL_SPLITS_WEIGHT`.
+    /// 6. `AmountZero` — the total weight across all receivers does not equal
+    ///    `TOTAL_SPLITS_WEIGHT` (reuses `AmountZero` to mean "sum mismatch").
+    ///
+    /// Does not require authorisation.  Does not read or write any storage key.
+    pub fn validate_splits_receivers(
+        env: Env,
+        receivers: Vec<SplitReceiver>,
+    ) -> Vec<VestFlowError> {
+        let mut errors: Vec<VestFlowError> = Vec::new(&env);
+
+        if receivers.is_empty() {
+            return errors;
+        }
+
+        if receivers.len() > MAX_SPLITS_RECEIVERS {
+            errors.push_back(VestFlowError::TooManyReceivers);
+        }
+
+        // Collect address-type receivers to detect duplicates.
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut has_duplicate = false;
+        for r in receivers.iter() {
+            if let SplitReceiver::Address(ref entry) = r {
+                if seen.contains(&entry.receiver) {
+                    has_duplicate = true;
+                } else {
+                    seen.push_back(entry.receiver.clone());
+                }
+            }
+        }
+        if has_duplicate {
+            errors.push_back(VestFlowError::DuplicateReceiver);
+        }
+
+        // Per-receiver weight validation.
+        let mut weight_error = false;
+        for r in receivers.iter() {
+            let w = match &r {
+                SplitReceiver::Address(a) => a.weight,
+                SplitReceiver::Nft(n) => n.weight,
+            };
+            if w == 0 && !weight_error {
+                errors.push_back(VestFlowError::WeightZero);
+                weight_error = true;
+            }
+            if w > TOTAL_SPLITS_WEIGHT {
+                errors.push_back(VestFlowError::WeightTooLarge);
+                break;
+            }
+        }
+
+        // Total weight must equal TOTAL_SPLITS_WEIGHT.
+        let total: u128 = receivers
+            .iter()
+            .map(|r| match &r {
+                SplitReceiver::Address(a) => a.weight,
+                SplitReceiver::Nft(n) => n.weight,
+            })
+            .sum();
+        if total != TOTAL_SPLITS_WEIGHT {
+            errors.push_back(VestFlowError::AmountZero);
+        }
+
+        errors
+    }
+
     /// Remove a single fixed-address splits receiver and redistribute its freed
     /// weight equally across the remaining receivers.
     ///
@@ -10638,6 +10723,42 @@ mod test {
     }
 
     #[test]
+    fn test_add_drips_list_members_batch_of_twenty_addresses() {
+        // Members are added one at a time (there is no bulk add-members
+        // entry point), but this exercises a list at the 20-member scale a
+        // real drips list might reach (#1099): every address lands at its
+        // expected index, the count tracks accurately, and funding splits
+        // evenly across all 20 once they're in.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _, token_address, _) = setup(&env);
+
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Big Team"));
+
+        let members: std::vec::Vec<Address> = (0..20).map(|_| Address::generate(&env)).collect();
+        for member in &members {
+            client.add_to_drips_list(&owner, &list_id, member);
+        }
+
+        assert_eq!(client.get_drips_list_member_count(&list_id).unwrap(), 20);
+        let list = client.get_drips_list(&list_id).unwrap();
+        assert_eq!(list.members.len(), 20);
+        for (i, member) in members.iter().enumerate() {
+            assert_eq!(client.drips_list_entry(&list_id, &(i as u32)), Some(member.clone()));
+        }
+        // Past the last member, there's nothing.
+        assert_eq!(client.drips_list_entry(&list_id, &20), None);
+
+        // 100/sec split across 20 members → 5/sec each.
+        client.fund_drips_list(&owner, &list_id, &token_address, &100, &1000);
+        for member in &members {
+            let stream = client.get_drips_stream(&list_id, member).unwrap();
+            assert_eq!(stream.amt_per_sec, 5);
+        }
+    }
+
+    #[test]
     fn test_drips_list_ownership_transfer_emits_event_and_allows_new_owner_edits() {
         let env = Env::default();
         env.mock_all_auths();
@@ -11648,6 +11769,77 @@ mod test {
         client.split(&account, &token_address, &4000);
         assert_eq!(token.balance(&address_receiver), 1000);
         assert_eq!(token.balance(&nft_owner), 3000);
+    }
+
+    #[test]
+    fn test_split_collect_sweeps_drips_list_accrual_and_splits_it() {
+        // `split_collect` is the combined receive-and-split entry point
+        // (#1098): it reads what `account` has already earned from its
+        // incoming drips-list stream and sweeps it straight to the split
+        // receivers, without a separate `collect` round trip.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member1, token_address, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_address);
+        let receiver_a = Address::generate(&env);
+        let receiver_b = Address::generate(&env);
+
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Payees"));
+        client.add_to_drips_list(&owner, &list_id, &member1);
+        // 1 member -> 100/sec, funded with a 1000-unit top-up.
+        client.fund_drips_list(&owner, &list_id, &token_address, &100, &1000);
+
+        // 50s at 100/sec would be 5000, but the funder only topped up 1000,
+        // so collectable_amount caps at the funded (and actually-held) balance.
+        set_time(&env, env.ledger().timestamp() + 50);
+
+        let curr_receivers = soroban_sdk::vec![
+            &env,
+            SplitReceiver::Address(AddressSplitsReceiver {
+                receiver: receiver_a.clone(),
+                weight: 300_000,
+            }),
+            SplitReceiver::Address(AddressSplitsReceiver {
+                receiver: receiver_b.clone(),
+                weight: 700_000,
+            }),
+        ];
+
+        let (collected, split_to_others) =
+            client.split_collect(&member1, &token_address, &curr_receivers);
+        assert_eq!(collected, 1000);
+        assert_eq!(split_to_others, 1000);
+        assert_eq!(token.balance(&receiver_a), 300); // 30% of 1000
+        assert_eq!(token.balance(&receiver_b), 700); // 70% of 1000
+
+        // The contract's own balance is now fully swept out, so a second
+        // call -- same elapsed time, same stream config -- sweeps nothing.
+        let (collected_again, split_to_others_again) =
+            client.split_collect(&member1, &token_address, &curr_receivers);
+        assert_eq!(collected_again, 0);
+        assert_eq!(split_to_others_again, 0);
+        assert_eq!(token.balance(&receiver_a), 300);
+        assert_eq!(token.balance(&receiver_b), 700);
+    }
+
+    #[test]
+    fn test_split_collect_empty_receivers_is_a_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member1, token_address, _) = setup(&env);
+
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Empty"));
+        client.add_to_drips_list(&owner, &list_id, &member1);
+        client.fund_drips_list(&owner, &list_id, &token_address, &100, &1000);
+        set_time(&env, env.ledger().timestamp() + 50);
+
+        let empty_receivers: Vec<SplitReceiver> = Vec::new(&env);
+        let (collected, split_to_others) =
+            client.split_collect(&member1, &token_address, &empty_receivers);
+        assert_eq!(collected, 0);
+        assert_eq!(split_to_others, 0);
     }
 
     #[test]
@@ -13720,6 +13912,83 @@ mod test {
         let (client, funder, _, token_address, _) = setup(&env);
 
         client.set_stream_and_splits(&funder, &token_address, &vec![&env], &0, &vec![&env]);
+    }
+
+    // ── validate_splits_receivers (#1110) ─────────────────────────────────────
+
+    /// Empty receiver list is valid; returns no errors.
+    #[test]
+    fn test_validate_splits_receivers_empty_is_valid() {
+        let env = Env::default();
+        let (client, _, _, _, _) = setup(&env);
+
+        let errors = client.validate_splits_receivers(&vec![&env]);
+
+        assert_eq!(errors.len(), 0);
+    }
+
+    /// Weight sum mismatch returns AmountZero error.
+    #[test]
+    fn test_validate_splits_receivers_weight_sum_mismatch() {
+        let env = Env::default();
+        let (client, _, _, _, _) = setup(&env);
+        let receiver = Address::generate(&env);
+
+        // Weight 1 does not equal TOTAL_SPLITS_WEIGHT.
+        let receivers = vec![
+            &env,
+            SplitReceiver::Address(AddressSplitsReceiver {
+                receiver,
+                weight: 1,
+            }),
+        ];
+        let errors = client.validate_splits_receivers(&receivers);
+
+        assert!(errors.contains(&VestFlowError::AmountZero));
+    }
+
+    /// Duplicate address receiver returns DuplicateReceiver error.
+    #[test]
+    fn test_validate_splits_receivers_duplicate_receiver() {
+        let env = Env::default();
+        let (client, _, _, _, _) = setup(&env);
+        let receiver = Address::generate(&env);
+
+        let receivers = vec![
+            &env,
+            SplitReceiver::Address(AddressSplitsReceiver {
+                receiver: receiver.clone(),
+                weight: TOTAL_SPLITS_WEIGHT / 2,
+            }),
+            SplitReceiver::Address(AddressSplitsReceiver {
+                receiver: receiver.clone(),
+                weight: TOTAL_SPLITS_WEIGHT / 2,
+            }),
+        ];
+        let errors = client.validate_splits_receivers(&receivers);
+
+        assert!(errors.contains(&VestFlowError::DuplicateReceiver));
+    }
+
+    /// Over MAX_SPLITS_RECEIVERS entries returns TooManyReceivers error.
+    #[test]
+    fn test_validate_splits_receivers_over_max_count() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (client, _, _, _, _) = setup(&env);
+
+        let count = MAX_SPLITS_RECEIVERS + 1;
+        let per_receiver: u128 = TOTAL_SPLITS_WEIGHT / count as u128;
+        let mut receivers: soroban_sdk::Vec<SplitReceiver> = Vec::new(&env);
+        for _ in 0..count {
+            receivers.push_back(SplitReceiver::Address(AddressSplitsReceiver {
+                receiver: Address::generate(&env),
+                weight: per_receiver,
+            }));
+        }
+        let errors = client.validate_splits_receivers(&receivers);
+
+        assert!(errors.contains(&VestFlowError::TooManyReceivers));
     }
 
     #[test]
