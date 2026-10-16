@@ -6,7 +6,61 @@
 // Safe to use in any environment (browser, Node.js, React Native).
 // ===========================================================================
 
+import { StrKey } from "@stellar/stellar-sdk";
 import type { ScheduleData } from "./types";
+
+/** Numeric error codes emitted by the VestFlow contract. */
+export enum DripsErrorCode {
+  NotFound = 1,
+  NotRevocable = 2,
+  AlreadyRevoked = 3,
+  NothingToClaim = 4,
+  AmountZero = 5,
+  DurationZero = 6,
+  CliffExceedsDuration = 7,
+  ScheduleRevoked = 8,
+  LockupLessThanCliff = 9,
+  InvalidToken = 10,
+  ProposalNotFound = 11,
+  ProposalNotExpired = 12,
+  ProposalExpired = 13,
+  ProposalAlreadyActivated = 14,
+  DurationTooShort = 15,
+  DelegationNotFound = 16,
+  DelegationRevoked = 17,
+  DelegationExpired = 18,
+  DelegationExhausted = 19,
+  NotDelegate = 20,
+  TooManyDelegations = 21,
+  MergeTypeMismatch = 22,
+  MergeTooFewSchedules = 23,
+  MergeTooManySchedules = 24,
+  MergeTokenMismatch = 25,
+  MergeOwnerMismatch = 26,
+  NftOwnerNotFound = 27,
+  NoSplits = 28,
+  SlotAlreadyClaimed = 29,
+  BatchExpired = 30,
+  InvalidProof = 31,
+  NotExpired = 32,
+  ProofTooDeep = 33,
+  WeightZero = 34,
+  WeightTooLarge = 35,
+  ListNotFound = 36,
+  DuplicateReceiver = 37,
+  TooManyReceivers = 38,
+}
+
+/** Extract a typed contract error code from Soroban error text. */
+export function parseDripsErrorCode(error: unknown): DripsErrorCode | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/(?:Contract(?: error|,)?|error)\D+(\d+)/i);
+  if (!match) return undefined;
+  const code = Number(match[1]);
+  return Number.isInteger(code) && code >= 1 && code <= 38
+    ? (code as DripsErrorCode)
+    : undefined;
+}
 
 /**
  * Convert an XLM amount string to stroops using integer-only arithmetic.
@@ -306,3 +360,63 @@ export function formatSchedule(
     progressPct,
   };
 }
+
+// ---------------------------------------------------------------------------
+// isStellarAddress (#1107) & formatXlm (#1106)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate whether a string is a valid Stellar public key (G... address).
+ *
+ * Uses StrKey.isValidEd25519PublicKey without making any network calls.
+ *
+ * @param address - Address string to validate
+ * @returns true if valid Stellar public key, false otherwise
+ */
+export function isStellarAddress(address: unknown): boolean {
+  if (typeof address !== "string") return false;
+  return StrKey.isValidEd25519PublicKey(address);
+}
+
+/**
+ * Format a stroop amount (1 XLM = 10,000,000 stroops) into a human-readable XLM string.
+ *
+ * Supports bigint, number, or numeric string inputs.
+ * Uses integer arithmetic to avoid floating point precision issues.
+ * Trims trailing zeros in the fractional part, displaying whole numbers without decimal points.
+ * Correctly formats negative values and extreme boundary values (e.g. min/max i128).
+ *
+ * @param stroops - The amount in stroops (bigint | number | string)
+ * @param maxFractionDigits - Maximum fractional digits to show (default: 7)
+ */
+export function formatXlm(
+  stroops: bigint | number | string,
+  maxFractionDigits: number = 7,
+): string {
+  const raw = BigInt(stroops);
+  const isNegative = raw < 0n;
+  const abs = isNegative ? -raw : raw;
+  const scale = 10_000_000n;
+  const whole = abs / scale;
+  const fraction = abs % scale;
+
+  const digits = Math.max(0, Math.min(7, maxFractionDigits));
+  if (digits === 0) {
+    return isNegative && whole !== 0n ? `-${whole}` : whole.toString();
+  }
+
+  const dropExponent = 7 - digits;
+  const truncated =
+    dropExponent > 0 ? fraction / 10n ** BigInt(dropExponent) : fraction;
+  const fractionStr = truncated
+    .toString()
+    .padStart(digits, "0")
+    .replace(/0+$/, "");
+
+  const result =
+    fractionStr.length > 0 ? `${whole}.${fractionStr}` : whole.toString();
+  return isNegative && (whole !== 0n || fractionStr.length > 0)
+    ? `-${result}`
+    : result;
+}
+

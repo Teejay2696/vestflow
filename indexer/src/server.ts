@@ -21,6 +21,7 @@ import {
   getDripsStreamingTvl,
   getDripsStreamsLastUpdated,
   getGiveSummary,
+  getProtocolTotals,
   getTvlStats,
   queryDripsListMembers,
   queryDripsLists,
@@ -40,7 +41,7 @@ import {
 import type { EventQueryParams, GiveQueryParams } from "./types";
 import { routeWebhookRequest } from "./webhook-api";
 import { routeNotificationsRequest } from "./notifications-api";
-import { startNotificationFanout } from "./sse";
+import { startNotificationFanout, registerBalanceStream } from "./sse";
 import {
   getTvlSeries,
   getScheduleHistory,
@@ -481,6 +482,24 @@ function handleAnalyticsTvl(
   }
 }
 
+function handleAnalyticsProtocolTotals(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
+  try {
+    const network = (searchParams.get("network") ?? "testnet") as
+      "mainnet" | "testnet";
+    if (network !== "mainnet" && network !== "testnet") {
+      return json(res, 400, { error: "network must be mainnet or testnet" });
+    }
+    const totals = getProtocolTotals(network);
+    json(res, 200, totals);
+  } catch (error) {
+    console.error("[server] Protocol totals query error:", error);
+    json(res, 500, { error: "Failed to compute protocol totals" });
+  }
+}
+
 function handleAnalyticsScheduleHistory(
   res: http.ServerResponse,
   scheduleId: number,
@@ -847,6 +866,25 @@ export function createServer(): http.Server {
       }
     }
 
+    // Balance SSE stream (#1105)
+    if (url.pathname === "/sse/balance") {
+      const account =
+        url.searchParams.get("account") ?? url.searchParams.get("wallet");
+      const token = url.searchParams.get("token");
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
+      });
+
+      res.write("retry: 1000\n\n");
+      registerBalanceStream(account, token, res);
+      return;
+    }
+
     if (req.method !== "GET") {
       return json(res, 405, {
         error: "Method not allowed",
@@ -887,6 +925,9 @@ export function createServer(): http.Server {
 
       case "/analytics/tvl":
         return handleAnalyticsTvl(res, url.searchParams);
+
+      case "/analytics/protocol/totals":
+        return handleAnalyticsProtocolTotals(res, url.searchParams);
 
       case "/analytics/cycles":
         return handleAnalyticsCycles(res, url.searchParams);

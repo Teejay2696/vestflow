@@ -19,6 +19,12 @@ import {
   getNotificationsSince,
   type AppNotification,
 } from "./app-notifications";
+import {
+  getCollectedEventsSince,
+  getMaxCollectedEventRowid,
+  onBalanceUpdate,
+  type BalanceUpdateEvent,
+} from "./db";
 
 /** SSE frame writer — `id:` carries the global cursor, `data:` the JSON body. */
 function writeSseEvent(res: http.ServerResponse, id: number, data: string): void {
@@ -93,13 +99,83 @@ export function broadcastToWallet(wallet: string, notification: AppNotification)
   return set.size;
 }
 
+// ── Balance SSE stream (#1105) ────────────────────────────────────────
+
+export interface BalanceSubscriber {
+  res: http.ServerResponse;
+  account: string | null;
+  token: string | null;
+}
+
+const balanceRegistry = new Set<BalanceSubscriber>();
+
+/**
+ * Registers a connection for live balance updates for a given account/token.
+ * When either is omitted, all balance updates match.
+ */
+export function registerBalanceStream(
+  account: string | null,
+  token: string | null,
+  res: http.ServerResponse,
+): void {
+  const sub: BalanceSubscriber = { res, account, token };
+  balanceRegistry.add(sub);
+
+  const cleanup = () => {
+    balanceRegistry.delete(sub);
+  };
+  res.on("close", cleanup);
+  res.on("error", cleanup);
+}
+
+/** Number of live balance SSE connections. */
+export function balanceConnectionCount(): number {
+  return balanceRegistry.size;
+}
+
+/**
+ * Broadcast a balance update to all matching subscribers.
+ */
+export function broadcastBalanceUpdate(event: {
+  account: string;
+  token: string;
+  amount: string;
+  total_collected?: string;
+  ledger?: number;
+}): number {
+  let count = 0;
+  const payload = JSON.stringify({
+    event: "balance",
+    event_type: "collected",
+    ...event,
+  });
+
+  for (const sub of balanceRegistry) {
+    if (sub.account && sub.account !== event.account) continue;
+    if (sub.token && sub.token !== event.token) continue;
+    try {
+      sub.res.write(`data: ${payload}\n\n`);
+      count++;
+    } catch {
+      // Reaped by close listener
+    }
+  }
+  return count;
+}
+
+// Subscribe to in-process collected event notifications
+onBalanceUpdate((event) => {
+  broadcastBalanceUpdate(event);
+});
+
 // ── Fan-out loop ──────────────────────────────────────────────────────
 
 let lastSeenId: number | null = null;
+let lastSeenBalanceRowid: number | null = null;
 let fanoutTimer: ReturnType<typeof setInterval> | null = null;
 let lastHeartbeat = 0;
 
-const FANOUT_INTERVAL_MS = Number(process.env.SSE_FANOUT_INTERVAL_MS ?? "500");
+const FANOUT_INTERVAL_MS = Number(process.env.SSE_FANOUT_INTERVAL_MS ?? "200");
 const HEARTBEAT_INTERVAL_MS = 15_000;
 
 /** Drains new notifications for every wallet and heartbeats live connections. */
@@ -116,6 +192,23 @@ export function fanoutTick(): void {
     if (notification.id > lastSeenId) lastSeenId = notification.id;
   }
 
+  // Poll for collect events inserted into DB
+  if (lastSeenBalanceRowid == null) {
+    lastSeenBalanceRowid = getMaxCollectedEventRowid();
+  }
+  const collectedEvents = getCollectedEventsSince(lastSeenBalanceRowid, 100);
+  for (const ev of collectedEvents) {
+    broadcastBalanceUpdate({
+      account: ev.account,
+      token: ev.token,
+      amount: ev.amount,
+      ledger: ev.ledger,
+    });
+    if (ev.rowid > lastSeenBalanceRowid) {
+      lastSeenBalanceRowid = ev.rowid;
+    }
+  }
+
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeat = now;
     for (const set of registry.values()) {
@@ -125,6 +218,13 @@ export function fanoutTick(): void {
         } catch {
           // Ignore — dead connections are reaped by the close listener.
         }
+      }
+    }
+    for (const sub of balanceRegistry) {
+      try {
+        sub.res.write(": ping\n\n");
+      } catch {
+        // Ignore
       }
     }
   }
@@ -144,5 +244,7 @@ export function stopNotificationFanout(): void {
     fanoutTimer = null;
   }
   lastSeenId = null;
+  lastSeenBalanceRowid = null;
   registry.clear();
+  balanceRegistry.clear();
 }
