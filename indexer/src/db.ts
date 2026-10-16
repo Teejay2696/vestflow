@@ -788,6 +788,13 @@ function applyEventProjection(
          total_collected_stroops = excluded.total_collected_stroops,
          updated_at = excluded.updated_at`,
     ).run(row.beneficiary, row.token, nextTotal, timestamp);
+    notifyBalanceUpdate({
+      account: row.beneficiary,
+      token: row.token,
+      amount: row.amount,
+      total_collected: nextTotal,
+      ledger: row.ledger,
+    });
     return;
   }
 
@@ -1316,6 +1323,116 @@ export function getTvlStats(network = parseNetwork(undefined)): TvlStats {
     total_value_locked: total.toString(),
     last_updated: Math.max(...rows.map((row) => row.last_updated)),
   };
+}
+
+// ── Protocol totals (#1104) ──────────────────────────────────────────
+
+export interface ProtocolTotals {
+  total_created: string;
+  total_claimed: string;
+  total_revoked_unvested: string;
+  total_value_locked: string;
+  active_schedules: number;
+}
+
+export function getProtocolTotals(network = parseNetwork(undefined)): ProtocolTotals {
+  const stats = computeTvlStats(network);
+  let totalCreated = 0n;
+  let totalClaimed = 0n;
+  let totalRevokedUnvested = 0n;
+  let totalValueLocked = 0n;
+  let activeSchedules = 0;
+
+  for (const asset of stats.assets) {
+    totalCreated += BigInt(asset.total_created);
+    totalClaimed += BigInt(asset.total_claimed);
+    totalRevokedUnvested += BigInt(asset.total_revoked_unvested);
+    totalValueLocked += BigInt(asset.total_value_locked);
+    activeSchedules += asset.active_schedules;
+  }
+
+  return {
+    total_created: totalCreated.toString(),
+    total_claimed: totalClaimed.toString(),
+    total_revoked_unvested: totalRevokedUnvested.toString(),
+    total_value_locked: totalValueLocked.toString(),
+    active_schedules: activeSchedules,
+  };
+}
+
+// ── Balance event notification (#1105) ───────────────────────────────
+
+export interface BalanceUpdateEvent {
+  account: string;
+  token: string;
+  amount: string;
+  total_collected?: string;
+  ledger?: number;
+}
+
+type BalanceUpdateListener = (event: BalanceUpdateEvent) => void;
+const balanceUpdateListeners = new Set<BalanceUpdateListener>();
+
+export function onBalanceUpdate(listener: BalanceUpdateListener): () => void {
+  balanceUpdateListeners.add(listener);
+  return () => {
+    balanceUpdateListeners.delete(listener);
+  };
+}
+
+export function notifyBalanceUpdate(event: BalanceUpdateEvent): void {
+  for (const listener of balanceUpdateListeners) {
+    try {
+      listener(event);
+    } catch {
+      // Ignore errors in listener
+    }
+  }
+}
+
+export interface CollectedEventRecord {
+  rowid: number;
+  id: string;
+  account: string;
+  token: string;
+  amount: string;
+  ledger: number;
+}
+
+export function getCollectedEventsSince(
+  lastRowid: number,
+  limit = 100,
+  network?: NetworkName,
+): CollectedEventRecord[] {
+  try {
+    const db = getDb(network);
+    const rows = db
+      .prepare(
+        `SELECT rowid, id, beneficiary AS account, token, amount, ledger
+         FROM schedule_events
+         WHERE event_type = 'collected' AND rowid > ?
+         ORDER BY rowid ASC
+         LIMIT ?`,
+      )
+      .all(lastRowid, limit) as CollectedEventRecord[];
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+export function getMaxCollectedEventRowid(network?: NetworkName): number {
+  try {
+    const db = getDb(network);
+    const row = db
+      .prepare(
+        "SELECT MAX(rowid) AS maxId FROM schedule_events WHERE event_type = 'collected'",
+      )
+      .get() as { maxId: number | null } | undefined;
+    return row?.maxId ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 // ── Drips indexed state queries ───────────────────────────────────────

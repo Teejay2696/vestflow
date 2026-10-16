@@ -15,7 +15,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write \"src/**/*.ts\"",
-    "format:check": "prettier --check \"src/**/*.ts\""
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "test": "node --import tsx/esm --test src/__tests__/**/*.test.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^15.1.0",
